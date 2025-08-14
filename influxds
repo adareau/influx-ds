@@ -1,0 +1,214 @@
+#! /usr/bin/env python3
+# % IMPORTS
+import argparse
+import logging
+import datetime
+from influxdb_client_3 import InfluxDBClient3
+
+# % LOGGER
+# setup format
+fmt = "[%(asctime)s] - %(name)s - %(levelname)s - %(message)s"
+# config : default level set to INFO
+logging.basicConfig(format=fmt, datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# % GLOBAL VARIABLES
+
+CLIENT = None
+ARGS = None
+TAGS = []
+FIELDS = []
+DATA = []
+SQL_QUERY = ""
+SQL_FMT = """
+SELECT
+  DATE_BIN(INTERVAL '{interval}', time) AS time,
+  {columns}
+FROM {table}
+WHERE {time}
+GROUP BY 1, \n  {tags}
+ORDER BY 1
+"""
+
+# % FUNCTIONS
+
+
+def parse_arguments():
+    global ARGS
+    # -- get arguments
+    # configure parser
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument("database", type=str, help="database name")
+    parser.add_argument("raw_measurement", type=str, help="raw measurement (origin)")
+    parser.add_argument(
+        "ds_measurement", type=str, help="downsampled measurement (destination)"
+    )
+    parser.add_argument("-t", "--token", type=str, help="database token", default="")
+    parser.add_argument(
+        "-i", "--ip", type=str, help="influxdb server ip", default="127.0.0.1"
+    )
+    parser.add_argument(
+        "-p", "--port", type=str, help="influxdb server port", default="8181"
+    )
+    parser.add_argument(
+        "-b", "--bin-interval", type=str, help="sql bin interval", default="1 minute"
+    )
+    parser.add_argument(
+        "--timespan",
+        choices=["today", "yesterday", "sql"],
+        default="sql",
+        help="time span definition",
+    )
+    parser.add_argument(
+        "--time-start",
+        type=str,
+        default="now() - INTERVAL '1 day'",
+        help="time span start in sql format",
+    )
+    parser.add_argument(
+        "--time-stop",
+        type=str,
+        default="now()",
+        help="time span start in sql format",
+    )
+
+    parser.add_argument(
+        "--print",
+        action="store_true",
+        help="Only prints the data request",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--dry-run",
+        action="store_true",
+        help="Does not write to the target database",
+    )
+    parser.add_argument("--debug", action="store_true", help="Start in debug mode")
+
+    # process
+    ARGS = parser.parse_args()
+
+
+def process_arguments():
+    global ARGS
+    if ARGS.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("debug mode enabled")
+
+
+def setup_influxdb_client():
+    """Prepares the influxdB3 client"""
+    global CLIENT, ARGS
+    host = f"http://{ARGS.ip}:{ARGS.port}"
+    logger.debug(
+        f"setup influxdb client for host '{host}' and database '{ARGS.database}'"
+    )
+    CLIENT = InfluxDBClient3(host=host, token=ARGS.token, database=ARGS.database)
+
+
+def get_columns():
+    """retrieve columns from the initial database and sorts
+    field from tags"""
+    global ARGS, CLIENT, TAGS, FIELDS
+    logger.debug("get columns")
+    # - get all columns for the table
+    query = f"SHOW COLUMNS IN {ARGS.raw_measurement}"
+    res = CLIENT.query(query=query, language="sql")
+    # - sort depending on type
+    for name, type in zip(res["column_name"], res["data_type"]):
+        if str(name) == "time":
+            continue
+        if str(type).startswith("Dict"):
+            TAGS.append(str(name))
+        else:
+            FIELDS.append(str(name))
+    logger.debug(f"found tags : {TAGS}")
+    logger.debug(f"found fields : {FIELDS}")
+
+
+def prepare_query():
+    """Prepares the SQL query to get data from the raw database.
+    Result is stored in the `SQL_QUERY` database"""
+    global ARGS, SQL_QUERY, SQL_FMT, TAGS, FIELDS
+    # prepare columns string
+    tags_str = ",\n  ".join(TAGS)
+    fields_str = ",\n  ".join([f"AVG({fname}) AS {fname}" for fname in FIELDS])
+    column_str = tags_str + ",\n  " + fields_str
+
+    # prepare date selection
+    match ARGS.timespan:
+        case "today":
+            # get dates
+            today = datetime.datetime.now(datetime.UTC)
+            tomorrow = today + datetime.timedelta(1)
+            today_str = today.strftime("%Y-%m-%d")
+            tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+            # prepare request
+            time_start = f"'{today_str} 00:00:00'"
+            time_stop = f"'{tomorrow_str} 00:00:00'"
+        case "yesterday":
+            # get dates
+            today = datetime.datetime.now(datetime.UTC)
+            yesterday = today - datetime.timedelta(1)
+            today_str = today.strftime("%Y-%m-%d")
+            yesterday_str = yesterday.strftime("%Y-%m-%d")
+            # prepare request
+            time_start = f"'{yesterday_str} 00:00:00'"
+            time_stop = f"'{today_str} 00:00:00'"
+        case "sql":
+            time_start = ARGS.time_start
+            time_stop = ARGS.time_stop
+    time_str = f"time >={time_start} AND time < {time_stop}"
+    # prepare query
+    SQL_QUERY = SQL_FMT.format(
+        interval=ARGS.bin_interval,
+        columns=column_str,
+        table=ARGS.raw_measurement,
+        time=time_str,
+        tags=tags_str,
+    )
+
+    if ARGS.print:
+        print(SQL_QUERY)
+        exit()
+
+
+def get_data():
+    """Retrieves data from the raw measurement table"""
+    global CLIENT, DATA, SQL_QUERY
+    logger.debug("getting data")
+    table = CLIENT.query(query=SQL_QUERY, language="sql")
+    data_frame = table.to_pandas()
+    data_frame = data_frame.sort_values(by="time")
+    DATA = data_frame
+
+
+def write_data():
+    """writes data"""
+    global CLIENT, ARGS, DATA, TAGS
+    logger.debug("writing data")
+    if ARGS.dry_run:
+        logger.info("dry-run, not writing")
+        exit()
+
+    CLIENT.write(
+        record=DATA,
+        data_frame_measurement_name=ARGS.ds_measurement,
+        data_frame_timestamp_column="time",
+        data_frame_tag_columns=TAGS,
+    )
+    logger.info("DONE !")
+
+# % RUN
+if __name__ == "__main__":
+    parse_arguments()
+    process_arguments()
+    setup_influxdb_client()
+    get_columns()
+    prepare_query()
+    get_data()
+    write_data()
